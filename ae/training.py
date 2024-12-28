@@ -9,7 +9,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
     
 from .dsets import ImageDataset
 from .model import Autoencoder
-from heig.fpca import LocalLinear
+# from heig.fpca import LocalLinear
 
 
 class TrainingApp:

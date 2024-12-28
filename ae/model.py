@@ -44,8 +44,10 @@ class Autoencoder(nn.Module):
     def encoder_block(self, input_channels, output_channels):
         encoder = nn.Sequential(
             nn.Conv3d(input_channels, output_channels, kernel_size=3, padding=1, bias=True),
+            nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=1, bias=True),
+            nn.BatchNorm3d(output_channels),
             nn.LeakyReLU(inplace=True),
             nn.MaxPool3d(kernel_size=2, stride=2)
         )
