@@ -2,7 +2,6 @@ import os
 import time
 import argparse
 import traceback
-import nibabel as nib
 
 import torch
 import torch.nn as nn
@@ -11,15 +10,15 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import lightning as L
-from pytorch_lightning.callbacks import (
+from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
     ProgressBar,
 )
-from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
+from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
     
-from .dsets import ImageDataset
-from .model import Autoencoder
+from dsets import ImageDataset
+from model import Autoencoder
 # from heig.fpca import LocalLinear
 from utils import *
 
@@ -30,7 +29,7 @@ class ReconstructionLoss:
         self.lambda_l2 = lambda_l2
         self.mse_loss = nn.MSELoss(reduction="mean")
 
-    def compute_masked_mse(self, target, recons, mask):
+    def compute_masked_mse(self, recons, target, mask):
         masked_recons = recons * mask
         masked_target = target * mask
         return self.mse_loss(masked_recons, masked_target)
@@ -49,11 +48,10 @@ class ReconstructionLoss:
 
 
 class Training(L.LightningModule):
-    def __init__(self, model, mask, lambda_l2):
+    def __init__(self, model, lambda_l2):
         super().__init__()
-        self.save_hyperparameters(["lambda_l2"])
+        self.save_hyperparameters(ignore=["model", "mask"])
         self.model = model
-        self.mask = mask
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
 
     def forward(self, inputs):
@@ -61,19 +59,21 @@ class Training(L.LightningModule):
         return latent
 
     def training_step(self, batch, batch_idx):
-        recons, _ = self.model(batch)
-        loss = self.loss_func(recons, batch)
-        self.log("train_loss", loss, on_epoch=True, prog_bar=True, logger=True)
+        image, mask = batch
+        recons, _ = self.model(image)
+        loss = self.loss_func(recons, image, mask)
+        self.log("train_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        recons, _ = self.model(batch)
-        loss = self.loss_func(recons, batch)
+        image, mask = batch
+        recons, _ = self.model(image)
+        loss = self.loss_func(recons, image, mask)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         return loss
     
     def configure_optimizers(self):
-        optimizer = Adam(self.parameters(), lr=0.001, **self.hparams.optimizer_hparams)
+        optimizer = Adam(self.parameters(), lr=0.001)
         lr_scheduler_config = {
             "scheduler": ReduceLROnPlateau(
                 optimizer,
@@ -107,62 +107,87 @@ def data_split(images, train_prop=0.8, seed=42):
 def check_input(args):
     if args.image is None:
         raise ValueError("--image is required")
-    if args.mask is None:
-        raise ValueError("--mask is required")
     if args.out is None:
         raise ValueError("--out is required")
     
     check_existence(args.image)
-    check_existence(args.mask)
+
+    if args.keep is not None:
+        args.keep = split_files(args.keep)
+        args.keep = read_keep(args.keep)
+        log.info(f"{len(args.keep)} subject(s) in --keep (logical 'and' for multiple files).")
+
+    if args.remove is not None:
+        args.remove = split_files(args.remove)
+        args.remove = read_remove(args.remove)
+        log.info(f"{len(args.remove)} subject(s) in --remove (logical 'or' for multiple files).")
 
 
 def main(args, log):
-    check_input(args, log)
-    mask = nib.load(args.mask).get_fdata()
-    images = ImageDataset(args.image, mask)
-    train_data, val_data = data_split(images)
+    check_input(args)
+    # mask = nib.load(args.mask).get_fdata()
 
-    train_dl = DataLoader(train_data, batch_size=32, pin_memory=True, shuffle=True)
-    val_dl = DataLoader(val_data,  batch_size=32, pin_memory=True, shuffle=False)
+    try:
+        images = ImageDataset(args.image)
+        images.keep_and_remove(args.keep, args.remove)
+        train_data, val_data = data_split(images)
 
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
+        train_dl = DataLoader(
+            train_data, 
+            batch_size=32, 
+            num_workers=2,
+            pin_memory=True, 
+            shuffle=True
+        )
+        val_dl = DataLoader(
+            val_data, 
+            batch_size=32, 
+            num_workers=2,
+            pin_memory=True, 
+            shuffle=False
+        )
 
-    model_checkpoint = ModelCheckpoint(
-        dirpath=args.out + "/model",
-        monitor="val_loss",
-        save_last=True,
-        filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}",
-        save_top_k=5,
-    )
+        lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    tb_logger = TensorBoardLogger(save_dir=args.out + "/tb_logs")
-    csv_logger = CSVLogger(save_dir=args.out + "/csv_logs")
-    pb = ProgressBar(refresh_rate=2)
+        model_checkpoint = ModelCheckpoint(
+            dirpath=args.out + "/model",
+            monitor="val_loss",
+            save_last=True,
+            filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}",
+            save_top_k=5,
+        )
 
-    # main training
-    model = Autoencoder(images.shape, args.latent_dim)
-    training_app = Training(model, mask, args.lambda_l2)
-    trainer = L.Trainer(
-        logger=[tb_logger, csv_logger],
-        callbacks=[lr_monitor, model_checkpoint, pb],
-        sync_batchnorm=True,
-        log_every_n_steps=20,
-        accelerator="auto",
-        devices=4,
-        benchmark=True,
-        max_epochs=100,
-    )
+        tb_logger = TensorBoardLogger(save_dir=args.out + "/tb_logs")
+        csv_logger = CSVLogger(save_dir=args.out + "/csv_logs")
+        # pb = ProgressBar()
 
-    trainer.fit(
-        training_app, train_dataloaders=train_dl, val_dataloaders=val_dl
-    )
+        # main training
+        model = Autoencoder(images.shape, args.latent_dim)
+        training_app = Training(model, args.lambda_l2)
+        trainer = L.Trainer(
+            logger=[tb_logger, csv_logger],
+            callbacks=[lr_monitor, model_checkpoint],
+            sync_batchnorm=True,
+            log_every_n_steps=20,
+            accelerator="gpu",
+            devices=2,
+            benchmark=True,
+            max_epochs=100
+        )
+
+        trainer.fit(
+            training_app, train_dataloaders=train_dl, val_dataloaders=val_dl
+        )
+    finally:
+        images.close()
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--image", help="directory to imputed images in HDF5 format.")
-parser.add_argument("--mask", help="a mask file (e.g., .nii.gz) as template.")
 parser.add_argument("--latent-dim", type=int, help="latent dimension")
 parser.add_argument("--lambda-l2", type=float, help="lambda of L2 penalty")
+parser.add_argument("--keep")
+parser.add_argument("--remove")
 parser.add_argument("--threads", type=int, help="number of threads.")
 parser.add_argument("--out", help="output (prefix).")
 

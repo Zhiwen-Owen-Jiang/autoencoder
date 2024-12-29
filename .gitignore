@@ -1,0 +1,9 @@
+.vscode/
+data/
+analysis/
+__pycache__/
+
+.nfs*
+slurm*
+error*
+start_job.sbatch

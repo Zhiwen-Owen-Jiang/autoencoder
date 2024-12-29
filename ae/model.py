@@ -35,12 +35,12 @@ class Autoencoder(nn.Module):
         )
 
         with torch.no_grad():
-            x_dummy = torch.zeros(1, *input_shape) # Dummy input to get dimensions
+            x_dummy = torch.zeros(1, 1, *input_shape) # Dummy input to get dimensions
             encoded_dummy = self.encoder(x_dummy)
             self.flattened_size = encoded_dummy.numel()
         
         self.fc_enc = nn.Linear(self.flattened_size, latent_dim)
-        flattened_image_size = input_shape[0] * input_shape[1] * input_shape[2] * input_shape[3]
+        flattened_image_size = input_shape[0] * input_shape[1] * input_shape[2]
         self.output_layer = nn.Linear(latent_dim, flattened_image_size)
 
         self._init_weights()
@@ -63,7 +63,7 @@ class Autoencoder(nn.Module):
         encoded_flat = encoded.view(encoded.size(0), -1)
         latent = self.fc_enc(encoded_flat)
         output = self.output_layer(latent)
-        output = output.view(-1, *self.input_shape)
+        output = output.view(-1, 1, *self.input_shape)
 
         return output, latent
 

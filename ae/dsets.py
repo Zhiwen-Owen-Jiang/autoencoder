@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import nibabel as nib
 import torch
+from tqdm import tqdm
 from torch.utils.data import Dataset
 from utils import *
 
@@ -69,7 +70,7 @@ class ImageDataset(Dataset):
         image_t = torch.from_numpy(image).to(torch.float32)
         image_t = image_t.unsqueeze(0)
 
-        return image_t
+        return image_t, self.mask
     
     def close(self):
         self.file.close()
@@ -79,6 +80,7 @@ class ImageImputation:
     def __init__(self, image_file, mask, out, crop=False, threads=1):
         self.file = h5py.File(image_file, "r")
         self.images = self.file["images"]
+        self.coord = self.file["coord"][:]
         ids = self.file["id"][:]
         self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
         self.n_sub = self.images.shape[0]
@@ -134,10 +136,10 @@ class ImageImputation:
     
     def impute(self):
         original_coord = tuple(zip(*self.coord))
-        impute_coord = tuple(zip*(self.nearest_point.keys()))
-        for idx, image in enumerate(self.images):
+        impute_coord = tuple(zip(*np.array(list(self.nearest_point.keys()))))
+        for idx, image in tqdm(enumerate(self.images), desc=f"{self.n_sub} images"):
             self.mask[original_coord] = image # (N, )
-            self.mask[impute_coord] = image[self.nearest_point.values()]
+            self.mask[impute_coord] = image[list(self.nearest_point.values())]
             with h5py.File(f"{self.out}_imputed_images.h5", "r+") as h5f:
                 h5f["images"][idx] = self.mask[self.z_range, self.y_range, self.x_range]
 
@@ -209,7 +211,7 @@ def main(args, log):
 
     log.info(f"Imputing images by the nearest neighbor ...")
     try:
-        image_imputation = ImageImputation(args.image, mask, args.out, crop=False, threads=args.threads)
+        image_imputation = ImageImputation(args.image, mask, args.out, crop=args.crop, threads=args.threads)
         image_imputation.get_nearest_neighbors(nearest_point)
         image_imputation.impute()
     finally:
@@ -222,6 +224,7 @@ parser.add_argument("--image", help="Directory to processed raw images in HDF5 f
 parser.add_argument("--mask", help="a mask file (e.g., .nii.gz) as template.")
 parser.add_argument("--nn", help="a dat file for nearest neighbor information.")
 parser.add_argument("--threads", type=int, help="number of threads.")
+parser.add_argument("--crop", action="store_true", help="if cropping image to remove unnecessary background.")
 parser.add_argument("--out", help="output (prefix).")
 
 
