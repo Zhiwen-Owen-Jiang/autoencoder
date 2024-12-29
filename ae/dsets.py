@@ -24,22 +24,21 @@ class ImageDataset(Dataset):
     
     """
 
-    def __init__(self, image_file, mask):
+    def __init__(self, image_file):
         """
         Parameters:
         ------------
         image_file: a image HDF5 file path. Images have been imputed and converted into 3D
-        mask: an np.array of image mask
         
         """
         self.file = h5py.File(image_file, "r")
         self.images = self.file["images"]
         ids = self.file["id"][:]
         self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
-        self.n_sub = self.images.shape[0]
+        self.n_sub, *self.shape = self.images.shape
         self.id_idxs = np.arange(len(self.ids))
         self.extracted_ids = self.ids
-        self.mask = mask
+        self.mask = torch.tensor(self.images[0] > 0, dtype=torch.float32)
 
     def keep_and_remove(self, keep_idvs=None, remove_idvs=None, check_empty=True):
         """
@@ -69,65 +68,119 @@ class ImageDataset(Dataset):
         image = self.images[self.id_idxs[index]]
         image_t = torch.from_numpy(image).to(torch.float32)
         image_t = image_t.unsqueeze(0)
-        
+
         return image_t
     
     def close(self):
         self.file.close()
 
 
-def impute_by_nearest_point(image_file, mask, output, nearest_point=None, threads=1):
-    """
-    Imputing images by the nearest point
-    
-    """
-    with h5py.File(image_file, "r") as file:
-        images = file["images"]
-        coord = file["coord"][:]
-        ids = file["id"][:]
-        ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
-        n_sub = images.shape[0]
-        
-        # extracting indices in the mask that need to impute
-        idxs_temp = np.where(mask == 1)
-        idxs_temp = set(zip(*idxs_temp))
-        idxs_res = tuple(zip(*coord.T))
-        idxs_to_impute = idxs_temp.difference(idxs_res)
-        idxs_res = np.array(idxs_res)
-        idxs_to_impute = np.array(list(idxs_to_impute))
+class ImageImputation:
+    def __init__(self, image_file, mask, out, crop=False, threads=1):
+        self.file = h5py.File(image_file, "r")
+        self.images = self.file["images"]
+        ids = self.file["id"][:]
+        self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
+        self.n_sub = self.images.shape[0]
 
-        # creating a new image h5 file
-        image_shape = mask.shape
-        with h5py.File(f"{output}_imputed_images.h5", "w") as h5f:
+        self.mask = mask
+        if crop:
+            self.image_shape, (self.z_range, self.y_range, self.x_range) = self._crop_image(mask)
+        else:
+            self.image_shape = mask.shape
+            self.z_range = slice(0, mask.shape[0])
+            self.y_range = slice(0, mask.shape[1])
+            self.x_range = slice(0, mask.shape[2])
+        
+        self.idxs_to_impute, self.idxs_res = self._idxs_to_impute()
+        self.out = out
+        self.threads = threads
+
+        with h5py.File(f"{self.out}_imputed_images.h5", "w") as h5f:
             new_images = h5f.create_dataset(
-                "images", shape=(n_sub, *image_shape), dtype="float32"
+                "images", shape=(self.n_sub, *self.image_shape), dtype="float32"
             )
             new_images.attrs["id"] = "id"
             new_images.attrs["coord"] = "coord"
             h5f.create_dataset("id", data=np.array(ids.tolist(), dtype="S10"))
-            h5f.create_dataset("coord", data=coord)
+            h5f.create_dataset("coord", data=self.coord)
 
-        # imputing images by the nearest neighbor and save
+    def _idxs_to_impute(self):
+        """
+        coord must be int
+        
+        """
+        idxs_temp = np.where(self.mask == 1)
+        idxs_temp = set(zip(*idxs_temp))
+        idxs_res = tuple(zip(*self.coord.T))
+        idxs_to_impute = idxs_temp.difference(idxs_res)
+        idxs_res = np.array(idxs_res)
+        idxs_to_impute = np.array(list(idxs_to_impute))
+
+        return idxs_to_impute, idxs_res
+    
+    def get_nearest_neighbors(self, nearest_point=None):
         if nearest_point is None:
-            nearest_point = get_nearest_point(idxs_res, idxs_to_impute, threads)
-            pickle.dump(nearest_point, open(f"{output}_nn.dat", "wb"))
-        for idx, image in enumerate(images):
-            for target, point in nearest_point.items():
-                mask[target] = image[point]
-                with h5py.File(f"{output}_imputed_images.h5", "r+") as h5f:
-                    h5f["images"][idx] = mask
+            self.nearest_point = {
+                tuple(idx): self._get_nearest_point(idx) for idx in self.idxs_to_impute
+            }
+            pickle.dump(nearest_point, open(f"{self.out}_nn.dat", "wb"))
+        else:
+            self.nearest_point = nearest_point
 
+    def _get_nearest_point(self, target):
+        dis = [np.sum((target - idx) ** 2) for idx in self.idxs_res]
+        return np.argmin(dis)
+    
+    def impute(self):
+        original_coord = tuple(zip(*self.coord))
+        impute_coord = tuple(zip*(self.nearest_point.keys()))
+        for idx, image in enumerate(self.images):
+            self.mask[original_coord] = image # (N, )
+            self.mask[impute_coord] = image[self.nearest_point.values()]
+            with h5py.File(f"{self.out}_imputed_images.h5", "r+") as h5f:
+                h5f["images"][idx] = self.mask[self.z_range, self.y_range, self.x_range]
 
-def get_nearest_point(idxs_res, idxs_to_impute, threads):
-    nearest_point = {
-        tuple(idx): _get_nearest_point(idx, idxs_res) for idx in idxs_to_impute
-    }
-    return nearest_point
+    @staticmethod
+    def _crop_image(image, margin=5):
+        """
+        Crops a 3D image around the non-zero region with an additional margin.
+        
+        Parameters:
+        ------------
+        image (numpy.ndarray): Input 3D image of shape (D, H, W).
+        margin (int): Number of voxels to include as margin around the non-zero region.
+        
+        Returns:
+        ---------
+        tuple: The slice indices used for cropping.
 
+        """
+        # Find the indices of the non-zero elements
+        non_zero_indices = np.argwhere(image != 0)
+        
+        # Get the bounding box of the non-zero region
+        z_min, y_min, x_min = non_zero_indices.min(axis=0)
+        z_max, y_max, x_max = non_zero_indices.max(axis=0)
+        
+        # Apply margins
+        z_min = max(z_min - margin, 0)
+        y_min = max(y_min - margin, 0)
+        x_min = max(x_min - margin, 0)
+        
+        z_max = min(z_max + margin + 1, image.shape[0])
+        y_max = min(y_max + margin + 1, image.shape[1])
+        x_max = min(x_max + margin + 1, image.shape[2])
+        
+        # Crop the image
+        # cropped_image = image[z_min:z_max, y_min:y_max, x_min:x_max]
+        shape = (z_max - z_min, y_max - y_min, x_max - x_min)
+        cropped_range = (slice(z_min, z_max), slice(y_min, y_max), slice(x_min, x_max))
 
-def _get_nearest_point(target, coord):
-    dis = [np.sum((target - idx) ** 2) for idx in coord]
-    return np.argmin(dis)
+        return shape, cropped_range
+
+    def close(self):
+        self.file.close()
 
 
 def check_input(args):
@@ -155,7 +208,12 @@ def main(args, log):
         nearest_point = None
 
     log.info(f"Imputing images by the nearest neighbor ...")
-    impute_by_nearest_point(args.image, mask, args.out, nearest_point, args.threads)
+    try:
+        image_imputation = ImageImputation(args.image, mask, args.out, crop=False, threads=args.threads)
+        image_imputation.get_nearest_neighbors(nearest_point)
+        image_imputation.impute()
+    finally:
+        image_imputation.close()
     log.info(f"Save the imputed images to {args.out}_imputed_images.h5")
 
 

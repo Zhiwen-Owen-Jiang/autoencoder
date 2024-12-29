@@ -24,9 +24,13 @@ class Autoencoder(nn.Module):
 
         self.encoder = nn.Sequential(
             self.encoder_block(1, 16),
+            nn.MaxPool3d(kernel_size=2, padding=1),
             self.encoder_block(16, 32),
+            nn.MaxPool3d(kernel_size=2, padding=1),
             self.encoder_block(32, 64),
+            nn.MaxPool3d(kernel_size=2, padding=1),
             self.encoder_block(64, 128),
+            nn.MaxPool3d(kernel_size=2, padding=1),
             self.encoder_block(128, 256)
         )
 
@@ -48,8 +52,7 @@ class Autoencoder(nn.Module):
             nn.LeakyReLU(inplace=True),
             nn.Conv3d(output_channels, output_channels, kernel_size=3, padding=1, bias=True),
             nn.BatchNorm3d(output_channels),
-            nn.LeakyReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=2, stride=2)
+            nn.LeakyReLU(inplace=True)
         )
 
         return encoder
@@ -62,7 +65,7 @@ class Autoencoder(nn.Module):
         output = self.output_layer(latent)
         output = output.view(-1, *self.input_shape)
 
-        return output
+        return output, latent
 
     def _init_weights(self):
         for m in self.modules():
