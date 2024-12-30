@@ -39,7 +39,8 @@ class ImageDataset(Dataset):
         self.n_sub, *self.shape = self.images.shape
         self.id_idxs = np.arange(len(self.ids))
         self.extracted_ids = self.ids
-        self.mask = torch.tensor(self.images[0] > 0, dtype=torch.float32)
+        self.mask = torch.tensor(self.images[0] > 0)
+        self.mask = self.mask.unsqueeze(0)
 
     def keep_and_remove(self, keep_idvs=None, remove_idvs=None, check_empty=True):
         """
@@ -67,6 +68,7 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, index):
         image = self.images[self.id_idxs[index]]
+        image = (image - image[self.mask.squeeze(0)].mean()) / image[self.mask.squeeze(0)].std()
         image_t = torch.from_numpy(image).to(torch.float32)
         image_t = image_t.unsqueeze(0)
 
@@ -95,10 +97,11 @@ class ImageImputation:
             self.x_range = slice(0, mask.shape[2])
         
         self.idxs_to_impute, self.idxs_res = self._idxs_to_impute()
+        self.mask[self.mask == 1] = 0 # reset mask 
         self.out = out
         self.threads = threads
 
-        with h5py.File(f"{self.out}_imputed_images.h5", "w") as h5f:
+        with h5py.File(f"{self.out}_3d_images.h5", "w") as h5f:
             new_images = h5f.create_dataset(
                 "images", shape=(self.n_sub, *self.image_shape), dtype="float32"
             )
@@ -136,11 +139,11 @@ class ImageImputation:
     
     def impute(self):
         original_coord = tuple(zip(*self.coord))
-        impute_coord = tuple(zip(*np.array(list(self.nearest_point.keys()))))
+        # impute_coord = tuple(zip(*np.array(list(self.nearest_point.keys()))))
         for idx, image in tqdm(enumerate(self.images), desc=f"{self.n_sub} images"):
             self.mask[original_coord] = image # (N, )
-            self.mask[impute_coord] = image[list(self.nearest_point.values())]
-            with h5py.File(f"{self.out}_imputed_images.h5", "r+") as h5f:
+            # self.mask[impute_coord] = image[list(self.nearest_point.values())]
+            with h5py.File(f"{self.out}_3d_images.h5", "r+") as h5f:
                 h5f["images"][idx] = self.mask[self.z_range, self.y_range, self.x_range]
 
     @staticmethod
@@ -215,7 +218,8 @@ def main(args, log):
         image_imputation.get_nearest_neighbors(nearest_point)
         image_imputation.impute()
     finally:
-        image_imputation.close()
+        if "image_imputation" in locals():
+            image_imputation.close()
     log.info(f"Save the imputed images to {args.out}_imputed_images.h5")
 
 

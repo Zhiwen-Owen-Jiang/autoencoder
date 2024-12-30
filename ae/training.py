@@ -30,8 +30,8 @@ class ReconstructionLoss:
         self.mse_loss = nn.MSELoss(reduction="mean")
 
     def compute_masked_mse(self, recons, target, mask):
-        masked_recons = recons * mask
-        masked_target = target * mask
+        masked_recons = recons[mask]
+        masked_target = target[mask]
         return self.mse_loss(masked_recons, masked_target)
     
     def compute_l2_penalty(self):
@@ -47,29 +47,51 @@ class ReconstructionLoss:
         return total_loss
 
 
-class Training(L.LightningModule):
-    def __init__(self, model, lambda_l2):
-        super().__init__()
-        self.save_hyperparameters(ignore=["model", "mask"])
+class ReconstructionCorr:
+    def __init__(self, model):
         self.model = model
+        
+    def compute_masked_corr(self, recons, target, mask):
+        masked_recons = recons[mask]
+        masked_target = target[mask]
+        stacked = torch.stack([masked_recons, masked_target], dim=0)
+        corr = torch.corrcoef(stacked)[0, 1]
+        return corr
+    
+    def __call__(self, recons, target, mask):
+        masked_corr = self.compute_masked_corr(recons, target, mask)
+        return masked_corr
+
+
+class Training(L.LightningModule):
+    def __init__(self, input_shape, latent_dim, lambda_l2=0):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = Autoencoder(input_shape, latent_dim)
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
+        self.corr_func = ReconstructionCorr(self.model)
 
     def forward(self, inputs):
-        _, latent = self.model(inputs)
-        return latent
+        image, mask = inputs
+        recons, latent = self.model(image)
+        return recons, latent, mask
 
     def training_step(self, batch, batch_idx):
         image, mask = batch
         recons, _ = self.model(image)
         loss = self.loss_func(recons, image, mask)
+        corr = self.corr_func(recons, image, mask)
         self.log("train_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("train_corr", corr, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         image, mask = batch
         recons, _ = self.model(image)
         loss = self.loss_func(recons, image, mask)
+        corr = self.corr_func(recons, image, mask)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        self.log("val_corr", corr, prog_bar=True, sync_dist=True)
         return loss
     
     def configure_optimizers(self):
@@ -93,6 +115,18 @@ class Training(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": lr_scheduler_config,
         }
+    
+    def on_after_backward(self):
+        # Log gradient norms after the backward pass
+        total_norm = 0
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.norm(2) # L2 norm of gradients
+                total_norm += param_norm ** 2
+                self.log(f"grad_norm_{name}", param_norm, prog_bar=False, logger=True)
+
+        total_norm = total_norm ** 0.5 # Square root of summed norms
+        self.log("grad_total_norm", total_norm, prog_bar=True, logger=True)
 
 
 def data_split(images, train_prop=0.8, seed=42):
@@ -125,7 +159,6 @@ def check_input(args):
 
 def main(args, log):
     check_input(args)
-    # mask = nib.load(args.mask).get_fdata()
 
     try:
         images = ImageDataset(args.image)
@@ -134,14 +167,14 @@ def main(args, log):
 
         train_dl = DataLoader(
             train_data, 
-            batch_size=32, 
+            batch_size=128, 
             num_workers=2,
             pin_memory=True, 
             shuffle=True
         )
         val_dl = DataLoader(
             val_data, 
-            batch_size=32, 
+            batch_size=1, 
             num_workers=2,
             pin_memory=True, 
             shuffle=False
@@ -153,7 +186,7 @@ def main(args, log):
             dirpath=args.out + "/model",
             monitor="val_loss",
             save_last=True,
-            filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}",
+            filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
             save_top_k=5,
         )
 
@@ -162,8 +195,7 @@ def main(args, log):
         # pb = ProgressBar()
 
         # main training
-        model = Autoencoder(images.shape, args.latent_dim)
-        training_app = Training(model, args.lambda_l2)
+        training_app = Training(images.shape, args.latent_dim, args.lambda_l2)
         trainer = L.Trainer(
             logger=[tb_logger, csv_logger],
             callbacks=[lr_monitor, model_checkpoint],
