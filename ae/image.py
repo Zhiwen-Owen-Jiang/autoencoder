@@ -74,11 +74,14 @@ class ImageReader:
                 executor.submit(self._quality_check_, idx, img_file): idx
                 for idx, img_file in enumerate(img_files)
             }
-            for future in tqdm(
+            for _ in tqdm(
                 concurrent.futures.as_completed(futures),
                 total=len(futures),
                 desc=f"{len(futures)} images",
             ):
+                pass
+
+            for future in concurrent.futures.as_completed(futures):
                 try:
                     idx = future.result()
                     if idx is not None:
@@ -130,11 +133,14 @@ class ImageReader:
                 executor.submit(self._read_save_image, idx, img_file)
                 for idx, img_file in enumerate(self.img_files)
             ]
-            for future in tqdm(
+            for _ in tqdm(
                 concurrent.futures.as_completed(futures),
                 total=len(futures),
                 desc=f"{len(futures)} images",
             ):
+                pass
+
+            for future in concurrent.futures.as_completed(futures):
                 try:
                     future.result()
                 except Exception as exc:
@@ -164,7 +170,7 @@ class ImageReader:
         try:
             img = nib.load(img_file)
             data = img.get_fdata()
-            return data
+            return data[self.z_range, self.y_range, self.x_range]
         except Exception as e:
             if isinstance(e, ValueError):
                 raise
