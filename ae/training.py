@@ -30,9 +30,9 @@ class ReconstructionLoss:
         self.mse_loss = nn.MSELoss(reduction="mean")
 
     def compute_masked_mse(self, recons, target, mask):
-        masked_recons = recons[mask]
+        recons = recons.view(-1)
         masked_target = target[mask]
-        return self.mse_loss(masked_recons, masked_target)
+        return self.mse_loss(recons, masked_target)
     
     def compute_l2_penalty(self):
         l2_penalty = 0
@@ -42,7 +42,10 @@ class ReconstructionLoss:
     
     def __call__(self, recons, target, mask):
         masked_mse_loss = self.compute_masked_mse(recons, target, mask)
-        l2_penalty = self.lambda_l2 * self.compute_l2_penalty()
+        if self.lambda_l2 > 0:
+            l2_penalty = self.lambda_l2 * self.compute_l2_penalty()
+        else:
+            l2_penalty = 0
         total_loss = masked_mse_loss + l2_penalty
         return total_loss
 
@@ -52,9 +55,9 @@ class ReconstructionCorr:
         self.model = model
         
     def compute_masked_corr(self, recons, target, mask):
-        masked_recons = recons[mask]
+        recons = recons.view(-1)
         masked_target = target[mask]
-        stacked = torch.stack([masked_recons, masked_target], dim=0)
+        stacked = torch.stack([recons, masked_target], dim=0)
         corr = torch.corrcoef(stacked)[0, 1]
         return corr
     
@@ -64,10 +67,10 @@ class ReconstructionCorr:
 
 
 class Training(L.LightningModule):
-    def __init__(self, input_shape, latent_dim, lambda_l2=0):
+    def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0):
         super().__init__()
         self.save_hyperparameters()
-        self.model = Autoencoder(input_shape, latent_dim)
+        self.model = Autoencoder(input_shape, latent_dim, n_voxels)
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
         self.corr_func = ReconstructionCorr(self.model)
 
@@ -162,12 +165,15 @@ def main(args, log):
 
     try:
         images = ImageDataset(args.image)
+        n_voxels = images.mask.sum().item()
+        log.info(f"image shape: {images.shape}, {n_voxels} target voxels.")
+
         images.keep_and_remove(args.keep, args.remove)
         train_data, val_data = data_split(images)
 
         train_dl = DataLoader(
             train_data, 
-            batch_size=128, 
+            batch_size=32, 
             num_workers=2,
             pin_memory=True, 
             shuffle=True
@@ -195,7 +201,7 @@ def main(args, log):
         # pb = ProgressBar()
 
         # main training
-        training_app = Training(images.shape, args.latent_dim, args.lambda_l2)
+        training_app = Training(images.shape, args.latent_dim, n_voxels, args.lambda_l2)
         trainer = L.Trainer(
             logger=[tb_logger, csv_logger],
             callbacks=[lr_monitor, model_checkpoint],

@@ -21,13 +21,14 @@ class ImageReader:
     3. Check duplicated images and images with zero variance
     
     """
-    def __init__(self, img_files, ids, coord_img_file, crop, qc, out_dir, threads=1):
+    def __init__(self, img_files, ids, coord_img_file, mask_file, crop, qc, out_dir, threads=1):
         """
         Parameters:
         ------------
         img_files: a list of image files
         ids: a list of ids
         coord_img_file: coordinate image file path
+        mask_file: mask file path
         crop: if cropping images
         qc: if doing quality control
         out_dir: output path
@@ -57,6 +58,10 @@ class ImageReader:
             [self.ids, self.ids], names=["FID", "IID"]
         )
         self.n_images = len(self.img_files)
+
+        mask = nib.load(mask_file).get_fdata()
+        mask = mask > 0
+        self.mask = mask[self.z_range, self.y_range, self.x_range]
 
     def _quality_check(self, img_files, ids, threads):
         """
@@ -111,6 +116,7 @@ class ImageReader:
             images = h5f.create_dataset(
                 "images", shape=(self.n_images, *self.image_shape), dtype="float32"
             )
+            h5f.create_dataset("mask", data=self.mask)
             h5f.create_dataset("id", data=np.array(self.ids.tolist(), dtype="S10"))
             h5f.create_dataset("coord", data=self.coord)
             images.attrs["id"] = "id"
@@ -266,6 +272,8 @@ def check_input(args):
         raise ValueError("--image-suffix is required")
     if args.coord_dir is None:
         raise ValueError("--coord-dir is required")
+    if args.mask is None:
+        raise ValueError("--mask is required")
     if args.out is None:
         raise ValueError("--out is required")
     
@@ -276,6 +284,7 @@ def check_input(args):
     for image_dir in args.image_dir:
         check_existence(image_dir)
     check_existence(args.coord_dir)
+    check_existence(args.mask)
 
 
 def main(args, log):
@@ -291,7 +300,16 @@ def main(args, log):
         )
     
     out_dir = f"{args.out}_images.h5"
-    img_reader = ImageReader(img_files, ids, args.coord_dir, args.crop, args.qc, out_dir, args.threads)
+    img_reader = ImageReader(
+        img_files, 
+        ids, 
+        args.coord_dir, 
+        args.mask, 
+        args.crop, 
+        args.qc, 
+        out_dir, 
+        args.threads
+    )
     img_reader.create_dataset()
     img_reader.read_save_image(args.threads)
 
@@ -302,6 +320,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--image-dir", help="Directory to processed raw images in HDF5 format.")
 parser.add_argument("--image-suffix", help="a mask file (e.g., .nii.gz) as template.")
 parser.add_argument("--coord-dir", help="a dat file for nearest neighbor information.")
+parser.add_argument("--mask", help="mask file path")
 parser.add_argument("--keep")
 parser.add_argument("--remove")
 parser.add_argument("--qc", action="store_true", help="if checking image quality")

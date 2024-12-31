@@ -15,10 +15,11 @@ Decoder: a single fully connected layer
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, input_shape, latent_dim):
+    def __init__(self, input_shape, latent_dim, n_voxels):
         super().__init__()
         self.input_shape = input_shape
         self.latent_dim = latent_dim
+        self.n_voxels = n_voxels
 
         self.batchnorm = nn.BatchNorm3d(1)
 
@@ -40,8 +41,7 @@ class Autoencoder(nn.Module):
             self.flattened_size = encoded_dummy.numel()
         
         self.fc_enc = nn.Linear(self.flattened_size, latent_dim)
-        flattened_image_size = input_shape[0] * input_shape[1] * input_shape[2]
-        self.output_layer = nn.Linear(latent_dim, flattened_image_size)
+        self.output_layer = nn.Linear(latent_dim, self.n_voxels)
 
         self._init_weights()
 
@@ -63,7 +63,6 @@ class Autoencoder(nn.Module):
         encoded_flat = encoded.view(encoded.size(0), -1)
         latent = self.fc_enc(encoded_flat)
         output = self.output_layer(latent)
-        output = output.view(-1, 1, *self.input_shape)
 
         return output, latent
 

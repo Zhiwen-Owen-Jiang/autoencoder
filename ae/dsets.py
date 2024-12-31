@@ -34,13 +34,12 @@ class ImageDataset(Dataset):
         """
         self.file = h5py.File(image_file, "r")
         self.images = self.file["images"]
+        self.mask = torch.from_numpy(self.file["mask"][:]).to(torch.bool).unsqueeze(0)
         ids = self.file["id"][:]
         self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
         self.n_sub, *self.shape = self.images.shape
         self.id_idxs = np.arange(len(self.ids))
         self.extracted_ids = self.ids
-        self.mask = torch.tensor(self.images[0] > 0)
-        self.mask = self.mask.unsqueeze(0)
 
     def keep_and_remove(self, keep_idvs=None, remove_idvs=None, check_empty=True):
         """
@@ -68,7 +67,7 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, index):
         image = self.images[self.id_idxs[index]]
-        image = (image - image[self.mask.squeeze(0)].mean()) / image[self.mask.squeeze(0)].std()
+        image = (image - image.mean()) / image.std()
         image_t = torch.from_numpy(image).to(torch.float32)
         image_t = image_t.unsqueeze(0)
 
