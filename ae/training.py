@@ -23,6 +23,17 @@ from model import Autoencoder
 from utils import *
 
 
+"""
+TODO: introduce kernel smoothing
+1. smooth the target voxels, input raw images, recover smooth voxels (Denoise AE)
+2. incorporate smoothing matrix in loss function, 
+    2.1 compute nearest neighbors
+    2.2 incorporate distance as weight in loss function
+    2.3 bandwidth is a hyperparameter to fine tune
+
+"""
+
+
 class ReconstructionLoss:
     def __init__(self, model, lambda_l2=0):
         self.model = model
