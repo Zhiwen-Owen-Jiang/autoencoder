@@ -10,6 +10,7 @@ import nibabel as nib
 import torch
 from tqdm import tqdm
 from torch.utils.data import Dataset
+import dataset as ds
 from utils import *
 
 
@@ -25,21 +26,23 @@ class ImageDataset(Dataset):
     
     """
 
-    def __init__(self, image_file):
+    def __init__(self, image_file, norm=True):
         """
         Parameters:
         ------------
         image_file: a image HDF5 file path. Images have been imputed and converted into 3D
+        norm: if normalize images with global mean and std
         
         """
         self.file = h5py.File(image_file, "r")
         self.images = self.file["images"]
-        self.mask = torch.from_numpy(self.file["mask"][:]).to(torch.bool).unsqueeze(0)
+        self.mask = torch.from_numpy(self.file["mask_32k"][:]).to(torch.bool).unsqueeze(0)
         ids = self.file["id"][:]
         self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
         self.n_sub, *self.shape = self.images.shape
         self.id_idxs = np.arange(len(self.ids))
         self.extracted_ids = self.ids
+        self.norm = norm
 
     def keep_and_remove(self, keep_idvs=None, remove_idvs=None, check_empty=True):
         """
@@ -53,9 +56,9 @@ class ImageDataset(Dataset):
 
         """
         if keep_idvs is not None:
-            self.extracted_ids = get_common_idxs(self.extracted_ids, keep_idvs)
+            self.extracted_ids = ds.get_common_idxs(self.extracted_ids, keep_idvs)
         if remove_idvs is not None:
-            self.extracted_ids = remove_idxs(self.extracted_ids, remove_idvs)
+            self.extracted_ids = ds.remove_idxs(self.extracted_ids, remove_idvs)
         if check_empty and len(self.extracted_ids) == 0:
             raise ValueError("no subject remaining after --keep and/or --remove")
         
@@ -67,7 +70,11 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, index):
         image = self.images[self.id_idxs[index]]
-        image = (image - image.mean()) / image.std()
+        if self.norm:
+            # image = (image - image.mean()) / image.std()
+            mask = self.mask.squeeze(0) 
+            image[mask] = image[mask] / image[mask].std()
+            # image = image / image.std()
         image_t = torch.from_numpy(image).to(torch.float32)
         image_t = image_t.unsqueeze(0)
 

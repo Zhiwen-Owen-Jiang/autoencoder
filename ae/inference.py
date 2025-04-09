@@ -122,7 +122,8 @@ def main(args, log):
         corr = list()
         image_std = list()
         for batch, mask in tqdm(inference_dl):
-            batch_std = batch.std()
+            batch_std = batch[mask].std()
+            # batch_std = batch.std()
             batch = batch.to(device)
             with torch.no_grad():
                 output, latent = model(batch)
