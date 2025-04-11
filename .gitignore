@@ -10,3 +10,4 @@ start_job.sbatch
 research_log.txt
 
 gwas/
+training_log/
