@@ -42,7 +42,8 @@ class ReconstructionLoss:
 
     def compute_masked_mse(self, recons, target, mask):
         recons = recons.view(-1)
-        masked_target = target[mask]
+        # masked_target = target[mask]
+        masked_target = target.view(-1)[mask.view(-1)]
         return self.mse_loss(recons, masked_target)
     
     def compute_l2_penalty(self):
@@ -67,7 +68,8 @@ class ReconstructionCorr:
         
     def compute_masked_corr(self, recons, target, mask):
         recons = recons.view(-1)
-        masked_target = target[mask]
+        # masked_target = target[mask]
+        masked_target = target.view(-1)[mask.view(-1)]
         stacked = torch.stack([recons, masked_target], dim=0)
         corr = torch.corrcoef(stacked)[0, 1]
         return corr
@@ -77,13 +79,36 @@ class ReconstructionCorr:
         return masked_corr
 
 
+class VoxelCorrLoss:
+    def __init__(self, model, lambda_corr=0.1):
+        self.model = model
+        self.lambda_corr = lambda_corr
+    
+    def compute_masked_corr(self, recons, target, mask):
+        mask_3d = mask[0, 0]
+        target = target.squeeze(1)[:, mask_3d]
+        target_centered = target - target.mean(dim=0, keepdim=True)
+        recons_centered = recons - recons.mean(dim=0, keepdim=True)
+        cov = (target_centered * recons_centered).mean(dim=0)
+        std_target = target_centered.std(dim=0) + 1e-8  # numerical stability
+        std_recon = recons_centered.std(dim=0) + 1e-8
+        corr_per_voxel = cov / (std_target * std_recon)
+        mean_corr = corr_per_voxel.mean()
+
+        return (self.lambda_corr * (1 - mean_corr).clamp(min=0, max=2))
+    
+    def __call__(self, recons, target, mask):
+        return self.compute_masked_corr(recons, target, mask)
+
+
 class Training(L.LightningModule):
-    def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0):
+    def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0, lambda_corr=0.1):
         super().__init__()
         self.save_hyperparameters()
         self.model = Autoencoder(input_shape, latent_dim, n_voxels)
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
         self.corr_func = ReconstructionCorr(self.model)
+        # self.voxel_corr_loss_func = VoxelCorrLoss(self.model, lambda_corr)
 
     def forward(self, inputs):
         image, mask = inputs
@@ -93,18 +118,27 @@ class Training(L.LightningModule):
     def training_step(self, batch, batch_idx):
         image, mask = batch
         recons, _ = self.model(image)
-        loss = self.loss_func(recons, image, mask)
+        recons_loss = self.loss_func(recons, image, mask)
+        # corr_loss = self.voxel_corr_loss_func(recons, image, mask)
+        loss = recons_loss
         corr = self.corr_func(recons, image, mask)
         self.log("train_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        # self.log("train_recons_loss", recons_loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("train_corr", corr, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        lr = self.optimizers().param_groups[0]['lr']
+        self.log("lr", lr, prog_bar=True, on_step=True, on_epoch=False)
+
         return loss
     
     def validation_step(self, batch, batch_idx):
         image, mask = batch
         recons, _ = self.model(image)
-        loss = self.loss_func(recons, image, mask)
+        recons_loss = self.loss_func(recons, image, mask)
+        # corr_loss = self.voxel_corr_loss_func(recons, image, mask)
+        loss = recons_loss
         corr = self.corr_func(recons, image, mask)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        # self.log("val_recons_loss", recons_loss, prog_bar=True, sync_dist=True)
         self.log("val_corr", corr, prog_bar=True, sync_dist=True)
         return loss
     
@@ -144,7 +178,7 @@ class Training(L.LightningModule):
 
 
 def data_split(images, train_prop=0.8, seed=42):
-    torch.manual_seed(seed)
+    # torch.manual_seed(seed)
     train_size = int(images.n_sub * train_prop)
     val_size = images.n_sub - train_size
     train_data, val_data = random_split(images, [train_size, val_size])
@@ -175,7 +209,7 @@ def main(args, log):
     check_input(args)
 
     try:
-        images = ImageDataset(args.image)
+        images = ImageDataset(args.image, norm=True)
         n_voxels = images.mask.sum().item()
         log.info(f"image shape: {images.shape}, {n_voxels} target voxels.")
 
@@ -203,8 +237,8 @@ def main(args, log):
             dirpath=args.out + "/model",
             monitor="val_loss",
             save_last=True,
-            filename="{epoch}-{train_loss:.6f}-{val_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
-            save_top_k=5,
+            filename="{epoch}-{lr:.6f}-{train_loss:.6f}-{val_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
+            save_top_k=3,
         )
 
         tb_logger = TensorBoardLogger(save_dir=args.out + "/tb_logs")
@@ -217,16 +251,23 @@ def main(args, log):
             logger=[tb_logger, csv_logger],
             callbacks=[lr_monitor, model_checkpoint],
             sync_batchnorm=True,
-            log_every_n_steps=20,
+            log_every_n_steps=10,
             accelerator="gpu",
             devices=2,
             benchmark=True,
-            max_epochs=100
+            max_epochs=200
         )
-
-        trainer.fit(
-            training_app, train_dataloaders=train_dl, val_dataloaders=val_dl
-        )
+        
+        if args.check_point is not None:
+            log.info(f"Read check point from {args.check_point}")
+            trainer.fit(
+                training_app, train_dataloaders=train_dl, val_dataloaders=val_dl, 
+                ckpt_path=args.check_point
+            )
+        else:
+            trainer.fit(
+                training_app, train_dataloaders=train_dl, val_dataloaders=val_dl
+            )
     finally:
         images.close()
 
@@ -235,6 +276,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--image", help="directory to imputed images in HDF5 format.")
 parser.add_argument("--latent-dim", type=int, help="latent dimension")
 parser.add_argument("--lambda-l2", type=float, help="lambda of L2 penalty")
+parser.add_argument("--check-point")
 parser.add_argument("--keep")
 parser.add_argument("--remove")
 parser.add_argument("--threads", type=int, help="number of threads.")
