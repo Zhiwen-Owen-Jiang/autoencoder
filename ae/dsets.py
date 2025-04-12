@@ -36,7 +36,9 @@ class ImageDataset(Dataset):
         """
         self.file = h5py.File(image_file, "r")
         self.images = self.file["images"]
-        self.mask = torch.from_numpy(self.file["mask_32k"][:]).to(torch.bool).unsqueeze(0)
+        self.image_std = self.file["image_std"][:]
+        self.squeezed_mask = torch.from_numpy(self.file["mask_32k"][:]).to(torch.bool)
+        self.mask = self.squeezed_mask.unsqueeze(0)
         ids = self.file["id"][:]
         self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
         self.n_sub, *self.shape = self.images.shape
@@ -70,15 +72,70 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, index):
         image = self.images[self.id_idxs[index]]
+        image_std = self.image_std[self.id_idxs[index]]
         if self.norm:
-            # image = (image - image.mean()) / image.std()
-            mask = self.mask.squeeze(0) 
-            image[mask] = image[mask] / image[mask].std()
-            # image = image / image.std()
-        image_t = torch.from_numpy(image).to(torch.float32)
+            image[self.squeezed_mask] = image[self.squeezed_mask] / image_std
+        image_t = torch.from_numpy(image)
         image_t = image_t.unsqueeze(0)
 
         return image_t, self.mask
+    
+    def close(self):
+        self.file.close()
+
+
+class MeshImageDataset(Dataset):
+    """
+    Creating a image dataset for meshed 3D surface
+    
+    """
+    def __init__(self, image_file):
+        """
+        Parameters:
+        ------------
+        image_file: a image HDF5 file path. Images have been imputed and converted into 3D
+        
+        """
+        self.file = h5py.File(image_file, "r")
+        self.images = self.file["images"]
+        self.edge_index = self.file["edge_index"][:]
+        ids = self.file["id"][:]
+        self.ids = pd.MultiIndex.from_arrays(ids.astype(str).T, names=["FID", "IID"])
+        self.n_sub, *self.shape = self.images.shape
+        self.id_idxs = np.arange(len(self.ids))
+        self.extracted_ids = self.ids
+
+    def keep_and_remove(self, keep_idvs=None, remove_idvs=None, check_empty=True):
+        """
+        Keeping and removing subjects
+
+        Parameters:
+        ------------
+        keep_idvs: subject indices in pd.MultiIndex to keep 
+        remove_idvs: subject indices in pd.MultiIndex to remove
+        check_empty: if check the current image set is empty
+
+        """
+        if keep_idvs is not None:
+            self.extracted_ids = ds.get_common_idxs(self.extracted_ids, keep_idvs)
+        if remove_idvs is not None:
+            self.extracted_ids = ds.remove_idxs(self.extracted_ids, remove_idvs)
+        if check_empty and len(self.extracted_ids) == 0:
+            raise ValueError("no subject remaining after --keep and/or --remove")
+        
+        self.n_sub = len(self.extracted_ids)
+        self.id_idxs = np.arange(len(self.ids))[self.ids.isin(self.extracted_ids)]
+
+    def __len__(self):
+        return self.n_sub
+    
+    def __getitem__(self, index):
+        image = self.images[self.id_idxs[index]]
+        image = image / image.std()
+        image_t = torch.from_numpy(image).to(torch.float32)
+        image_t = image_t.unsqueeze(0)
+
+        return image_t, self.edge_index
     
     def close(self):
         self.file.close()

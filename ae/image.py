@@ -221,6 +221,198 @@ class ImageReader:
         return shape, cropped_range
     
 
+class MeshImageReader:
+    """
+    A class of reading CIFTI images
+
+    1. Images can be saved in muliple directories
+    2. Support keep and remove
+    3. Check duplicated images and images with zero variance
+    
+    """
+    def __init__(self, img_files, ids, coord_img_file, qc, out_dir, threads=1):
+        """
+        Parameters:
+        ------------
+        img_files: a list of image files
+        ids: a list of ids
+        coord_img_file: coordinate image file path
+        qc: if doing quality control
+        out_dir: output path
+        threads: number of threads
+        
+        """
+        self.out_dir = out_dir
+        self.logger = logging.getLogger(__name__)
+
+        # read coordinate image
+        coord_image = nib.load(coord_img_file).darrays
+        self.coord = coord_image[0].data
+        faces = coord_image[1].data
+        self.edge_index = self._get_edge_index(faces)
+
+        self.n_voxels = self.coord.shape[0]
+        if qc:
+            self.img_files, self.ids = self._quality_check(img_files, ids, threads)
+        else:
+            self.img_files, self.ids = img_files, ids
+        self.ids = pd.MultiIndex.from_arrays(
+            [self.ids, self.ids], names=["FID", "IID"]
+        )
+        self.n_images = len(self.img_files)
+
+    def _get_edge_index(self, faces):
+        """
+        Get edge index as an undirected graph
+        
+        """
+        edge_index = []
+        for tri in faces:
+            i, j, k = tri
+            edge_index.append([i, j])
+            edge_index.append([j, k])
+            edge_index.append([k, i])
+        edge_index = np.array(edge_index).T
+
+        # Add reverse edges
+        reversed_edges = edge_index[[1, 0], :]
+        full_edges = np.concatenate([edge_index, reversed_edges], axis=1)
+
+        # Remove duplicate edges by sorting and using np.unique
+        # Sort each column (i.e., [i, j] and [j, i] become [min, max])
+        min_vals = np.minimum(full_edges[0], full_edges[1])
+        max_vals = np.maximum(full_edges[0], full_edges[1])
+        undirected = np.stack([min_vals, max_vals], axis=0)
+
+        # Remove duplicates (columns are edges)
+        undirected = np.unique(undirected, axis=1)
+
+        # Optionally: remove self-loops
+        self_loop_mask = undirected[0] != undirected[1]
+        undirected = undirected[:, self_loop_mask]
+
+        return undirected  # shape: [2, num_undirected_edges]
+
+    def _quality_check(self, img_files, ids, threads):
+        """
+        Checking image quality
+        1. Images with exceeding zeros
+        2. Images with zero variance
+        
+        """
+        self.logger.info("Checking image quality ...")
+        good_img_files = list()
+        good_ids = list()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {
+                executor.submit(self._quality_check_, idx, img_file): idx
+                for idx, img_file in enumerate(img_files)
+            }
+            for _ in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc=f"{len(futures)} images",
+            ):
+                pass
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx = future.result()
+                    if idx is not None:
+                        good_img_files.append(img_files[idx])
+                        good_ids.append(ids[idx])
+                except Exception as exc:
+                    raise RuntimeError(f"Computation terminated due to error: {exc}")
+                
+        return good_img_files, good_ids
+
+    def _quality_check_(self, idx, img_file):
+        image = self._read_image(img_file)
+        if (image > 0).sum() < 0.95 * self.n_voxels:
+            self.logger.info(f"{img_file} is an invalid image with exceeding 0s.")
+            return None
+        if np.std(image) == 0:
+            self.logger.info(f"{img_file} is an invalid image with variance 0.")
+            return None
+        return idx
+
+    def create_dataset(self):
+        """
+        Creating a HDF5 file saving images, coordinates, and ids
+
+        """
+        with h5py.File(self.out_dir, "w") as h5f:
+            images = h5f.create_dataset(
+                "images", shape=(self.n_images, self.n_voxels), dtype="float32"
+            )
+            h5f.create_dataset("edge_index", data=self.edge_index)
+            h5f.create_dataset("id", data=np.array(self.ids.tolist(), dtype="S10"))
+            h5f.create_dataset("coord", data=self.coord)
+            images.attrs["id"] = "id"
+            images.attrs["coord"] = "coord"
+            images.attrs["edge_index"] = "edge_index"
+        self.logger.info(
+            (
+                f"{self.n_images} subjects and {self.n_voxels} voxels (vertices) in the imaging data."
+            )
+        )
+        
+    def read_save_image(self, threads):
+        """
+        Reading and saving images in parallel
+
+        """
+        self.logger.info("Reading images ...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [
+                executor.submit(self._read_save_image, idx, img_file)
+                for idx, img_file in enumerate(self.img_files)
+            ]
+            for _ in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc=f"{len(futures)} images",
+            ):
+                pass
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    executor.shutdown(wait=False)
+                    if os.path.exists(f"{self.out_dir}.lock"):
+                        os.remove(f"{self.out_dir}.lock")
+                    if os.path.exists(self.out_dir):
+                        os.remove(self.out_dir)
+                    raise RuntimeError(f"Computation terminated due to error: {exc}")
+
+        self.logger.info("Done.")
+        if os.path.exists(f"{self.out_dir}.lock"):
+            os.remove(f"{self.out_dir}.lock")
+
+    def _read_save_image(self, idx, img_file):
+        """
+        Reading and writing a single image
+
+        """
+        image = self._read_image(img_file)
+        lock_file = f"{self.out_dir}.lock"
+        with FileLock(lock_file):
+            with h5py.File(self.out_dir, "r+") as h5f:
+                h5f["images"][idx] = image
+
+    def _read_image(self, img_file):
+        try:
+            img = nib.load(img_file)
+            data = img.get_fdata()[0]
+            return data
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise
+            raise RuntimeError(f"cannot read {img_file}, did you provide a wrong CIFTI image?")
+
+
 def get_image_list(img_dirs, suffixes, log, keep_idvs=None, remove_idvs=None):
     """
     Getting file path of images from multiple directories.
@@ -254,9 +446,6 @@ def get_image_list(img_dirs, suffixes, log, keep_idvs=None, remove_idvs=None):
                     else:
                         img_files[img_id] = os.path.join(img_dir, img_file)
     img_files = dict(sorted(img_files.items()))
-    # ids = pd.MultiIndex.from_arrays(
-    #     [img_files.keys(), img_files.keys()], names=["FID", "IID"]
-    # )
     ids = list(img_files.keys())
     img_files_list = list(img_files.values())
     if n_dup > 0:
@@ -265,15 +454,15 @@ def get_image_list(img_dirs, suffixes, log, keep_idvs=None, remove_idvs=None):
     return ids, img_files_list
 
 
-def check_input(args):
+def check_input(args, log):
     if args.image_dir is None:
         raise ValueError("--image-dir is required")
     if args.image_suffix is None:
         raise ValueError("--image-suffix is required")
     if args.coord_dir is None:
         raise ValueError("--coord-dir is required")
-    if args.mask is None:
-        raise ValueError("--mask is required")
+    # if args.mask is None:
+    #     raise ValueError("--mask is required")
     if args.out is None:
         raise ValueError("--out is required")
     
@@ -284,11 +473,21 @@ def check_input(args):
     for image_dir in args.image_dir:
         check_existence(image_dir)
     check_existence(args.coord_dir)
-    check_existence(args.mask)
+    # check_existence(args.mask)
+    
+    if args.keep is not None:
+        args.keep = split_files(args.keep)
+        args.keep = read_keep(args.keep)
+        log.info(f"{len(args.keep)} subject(s) in --keep (logical 'and' for multiple files).")
+
+    if args.remove is not None:
+        args.remove = split_files(args.remove)
+        args.remove = read_remove(args.remove)
+        log.info(f"{len(args.remove)} subject(s) in --remove (logical 'or' for multiple files).")
 
 
 def main(args, log):
-    check_input(args)
+    check_input(args, log)
     
     ids, img_files = get_image_list(
         args.image_dir, args.image_suffix, log, args.keep, args.remove
@@ -300,16 +499,26 @@ def main(args, log):
         )
     
     out_dir = f"{args.out}_images.h5"
-    img_reader = ImageReader(
-        img_files, 
-        ids, 
-        args.coord_dir, 
-        args.mask, 
-        args.crop, 
-        args.qc, 
-        out_dir, 
-        args.threads
-    )
+    if args.coord_dir.endswith("nii.gz") or args.coord_dir.endswith("nii"):
+        img_reader = ImageReader(
+            img_files, 
+            ids, 
+            args.coord_dir, 
+            args.mask, 
+            args.crop, 
+            args.qc, 
+            out_dir, 
+            args.threads
+        )
+    elif args.coord_dir.endswith("gii.gz") or args.coord_dir.endswith("gii"):
+        img_reader = MeshImageReader(
+            img_files, 
+            ids, 
+            args.coord_dir, 
+            args.qc, 
+            out_dir, 
+            args.threads
+        )
     img_reader.create_dataset()
     img_reader.read_save_image(args.threads)
 
