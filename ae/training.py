@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.nn.functional as F
 
 import lightning as L
 from lightning.pytorch.callbacks import (
@@ -80,35 +81,45 @@ class ReconstructionCorr:
 
 
 class VoxelCorrLoss:
-    def __init__(self, model, lambda_corr=0.1):
+    def __init__(self, model, lambda_corr=0.3):
         self.model = model
         self.lambda_corr = lambda_corr
     
-    def compute_masked_corr(self, recons, target, mask):
+    def compute_masked_corr(self, recons, target, mask, image_std):
         mask_3d = mask[0, 0]
-        target = target.squeeze(1)[:, mask_3d]
+        target = target.squeeze(1)[:, mask_3d] * image_std
+        recons = recons * image_std
         target_centered = target - target.mean(dim=0, keepdim=True)
         recons_centered = recons - recons.mean(dim=0, keepdim=True)
         cov = (target_centered * recons_centered).mean(dim=0)
-        std_target = target_centered.std(dim=0) + 1e-8  # numerical stability
-        std_recon = recons_centered.std(dim=0) + 1e-8
+        std_target = target_centered.std(dim=0) + 1e-6  # numerical stability
+        std_recon = recons_centered.std(dim=0) + 1e-6
         corr_per_voxel = cov / (std_target * std_recon)
         mean_corr = corr_per_voxel.mean()
 
         return (self.lambda_corr * (1 - mean_corr).clamp(min=0, max=2))
     
-    def __call__(self, recons, target, mask):
-        return self.compute_masked_corr(recons, target, mask)
+    def compute_cosine_loss(self, recons, target, mask, image_std):
+        mask_3d = mask[0, 0]
+        target = target.squeeze(1)[:, mask_3d] * image_std
+        recons = recons * image_std
+        cos_loss = 1 - F.cosine_similarity(recons, target, dim=0).mean()
+
+        return cos_loss
+    
+    def __call__(self, recons, target, mask, image_std):
+        return self.compute_masked_corr(recons, target, mask, image_std)
+        # return self.compute_cosine_loss(recons, target, mask, image_std)
 
 
 class Training(L.LightningModule):
-    def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0, lambda_corr=0.1):
+    def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0, lambda_corr=0.3):
         super().__init__()
         self.save_hyperparameters()
         self.model = Autoencoder(input_shape, latent_dim, n_voxels)
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
         self.corr_func = ReconstructionCorr(self.model)
-        # self.voxel_corr_loss_func = VoxelCorrLoss(self.model, lambda_corr)
+        self.voxel_corr_loss_func = VoxelCorrLoss(self.model, lambda_corr)
 
     def forward(self, inputs):
         image, mask = inputs
@@ -116,14 +127,16 @@ class Training(L.LightningModule):
         return recons, latent, mask
 
     def training_step(self, batch, batch_idx):
-        image, mask = batch
+        image, mask, image_std_t = batch
         recons, _ = self.model(image)
         recons_loss = self.loss_func(recons, image, mask)
-        # corr_loss = self.voxel_corr_loss_func(recons, image, mask)
-        loss = recons_loss
+        corr_loss = self.voxel_corr_loss_func(recons, image, mask, image_std_t)
+        loss = recons_loss + corr_loss
+        # loss = recons_loss
         corr = self.corr_func(recons, image, mask)
+        self.log("train_corr_loss", corr_loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("train_recons_loss", recons_loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("train_loss", loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        # self.log("train_recons_loss", recons_loss, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.log("train_corr", corr, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         lr = self.optimizers().param_groups[0]['lr']
         self.log("lr", lr, prog_bar=True, on_step=True, on_epoch=False)
@@ -131,14 +144,16 @@ class Training(L.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        image, mask = batch
+        image, mask, image_std_t = batch
         recons, _ = self.model(image)
         recons_loss = self.loss_func(recons, image, mask)
-        # corr_loss = self.voxel_corr_loss_func(recons, image, mask)
-        loss = recons_loss
+        corr_loss = self.voxel_corr_loss_func(recons, image, mask, image_std_t)
+        loss = recons_loss + corr_loss
+        # loss = recons_loss
         corr = self.corr_func(recons, image, mask)
+        self.log("val_corr_loss", corr_loss, prog_bar=True, sync_dist=True)
+        self.log("val_recons_loss", recons_loss, prog_bar=True, sync_dist=True)
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
-        # self.log("val_recons_loss", recons_loss, prog_bar=True, sync_dist=True)
         self.log("val_corr", corr, prog_bar=True, sync_dist=True)
         return loss
     
@@ -225,7 +240,7 @@ def main(args, log):
         )
         val_dl = DataLoader(
             val_data, 
-            batch_size=1, 
+            batch_size=32, 
             num_workers=2,
             pin_memory=True, 
             shuffle=False
@@ -237,7 +252,8 @@ def main(args, log):
             dirpath=args.out + "/model",
             monitor="val_loss",
             save_last=True,
-            filename="{epoch}-{lr:.6f}-{train_loss:.6f}-{val_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
+            # filename="{epoch}-{lr:.6f}-{train_loss:.6f}-{val_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
+            filename="{epoch}-{lr:.6f}-{train_corr_loss:.6f}-{train_recons_loss:.6f}-{val_corr_loss:.6f}-{val_recons_loss:.6f}-{train_corr:.6f}-{val_corr:.6f}",
             save_top_k=3,
         )
 
@@ -255,7 +271,9 @@ def main(args, log):
             accelerator="gpu",
             devices=2,
             benchmark=True,
-            max_epochs=200
+            max_epochs=200,
+            gradient_clip_val=1.0,
+            gradient_clip_algorithm="norm",
         )
         
         if args.check_point is not None:
