@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv, global_mean_pool, BatchNorm
+import torch.nn.functional as F
 
 
 """
@@ -25,15 +26,22 @@ class Autoencoder(nn.Module):
         self.batchnorm = nn.BatchNorm3d(1)
 
         self.encoder = nn.Sequential(
-            self.encoder_block(1, 16),
+            # self.encoder_block(1, 16),
+            ResBlock3D(1, 16),
             nn.MaxPool3d(kernel_size=2, padding=1),
-            self.encoder_block(16, 32),
+            # self.encoder_block(16, 32),
+            ResBlock3D(16, 32),
             nn.MaxPool3d(kernel_size=2, padding=1),
-            self.encoder_block(32, 64),
+            # self.encoder_block(32, 64),
+            ResBlock3D(32, 64),
             nn.MaxPool3d(kernel_size=2, padding=1),
-            self.encoder_block(64, 128),
+            # self.encoder_block(64, 128),
+            ResBlock3D(64, 128),
             nn.MaxPool3d(kernel_size=2, padding=1),
-            self.encoder_block(128, 256)
+            # self.encoder_block(128, 256)
+            ResBlock3D(128, 256),
+            nn.MaxPool3d(kernel_size=2, padding=1),
+            ResBlock3D(256, 512),
         )
 
         with torch.no_grad():
@@ -76,6 +84,33 @@ class Autoencoder(nn.Module):
                     bound = 1 / np.sqrt(fan_out)
                     nn.init.normal_(m.bias, -bound, bound)
 
+
+class ResBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_channels),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_channels)
+        )
+        
+        # If in_channels ≠ out_channels, use a projection to match shapes
+        self.projection = None
+        if in_channels != out_channels:
+            self.projection = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm3d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = x
+        if self.projection is not None:
+            identity = self.projection(x)
+        out = self.conv_block(x)
+        return F.leaky_relu(out + identity)
+    
 
 class GNNAutoencoder(nn.Module):
     def __init__(self, latent_dim, n_voxels):
