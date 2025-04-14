@@ -120,14 +120,14 @@ def main(args, log):
         log.info("Computing latent features ...")
         latents = list()
         corr = list()
-        for image, mask in tqdm(inference_dl):
+        for image, mask, image_std_t in tqdm(inference_dl):
             image = image.to(device)
             with torch.no_grad():
                 output, latent = model(image)
             latents.append(np.squeeze(latent.cpu().numpy()))
             corr.append(compute_masked_corr(output, image, mask).cpu().numpy())
         ldrs = np.array(latents)
-        image_std = images.image_std
+        image_std = images.get_std()
         ldrs = image_std.reshape(-1, 1) * ldrs
         n_ldrs = ldrs.shape[1]
         log.info(f"Reconstruction correlation: {np.mean(corr):.3f}({np.std(corr):.3f})")

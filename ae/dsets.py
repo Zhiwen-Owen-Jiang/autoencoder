@@ -67,6 +67,9 @@ class ImageDataset(Dataset):
         self.n_sub = len(self.extracted_ids)
         self.id_idxs = np.arange(len(self.ids))[self.ids.isin(self.extracted_ids)]
 
+    def get_std(self):
+        return self.image_std[self.id_idxs]
+
     def __len__(self):
         return self.n_sub
     
@@ -77,8 +80,10 @@ class ImageDataset(Dataset):
             image[self.squeezed_mask] = image[self.squeezed_mask] / image_std
         image_t = torch.from_numpy(image)
         image_t = image_t.unsqueeze(0)
+        image_std_t = torch.tensor(image_std)
+        image_std_t = image_std_t.unsqueeze(0)
 
-        return image_t, self.mask
+        return image_t, self.mask, image_std_t
     
     def close(self):
         self.file.close()
