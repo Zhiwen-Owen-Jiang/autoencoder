@@ -19,7 +19,7 @@ from lightning.pytorch.callbacks import (
 from lightning.pytorch.loggers import TensorBoardLogger, CSVLogger
     
 from dsets import ImageDataset
-from model import Autoencoder
+from model import Autoencoder, ResNet3DAutoEncoder
 # from heig.fpca import LocalLinear
 from utils import *
 
@@ -116,7 +116,8 @@ class Training(L.LightningModule):
     def __init__(self, input_shape, latent_dim, n_voxels, lambda_l2=0, lambda_corr=0.3):
         super().__init__()
         self.save_hyperparameters()
-        self.model = Autoencoder(input_shape, latent_dim, n_voxels)
+        # self.model = Autoencoder(input_shape, latent_dim, n_voxels)
+        self.model = ResNet3DAutoEncoder(input_shape, latent_dim, n_voxels)
         self.loss_func = ReconstructionLoss(self.model, lambda_l2)
         self.corr_func = ReconstructionCorr(self.model)
         self.voxel_corr_loss_func = VoxelCorrLoss(self.model, lambda_corr)
